@@ -48,8 +48,13 @@ CREATE TABLE IF NOT EXISTS snaps(aid BIGINT, cid BIGINT, data TEXT, PRIMARY KEY(
 CREATE TABLE IF NOT EXISTS audit(id BIGSERIAL PRIMARY KEY, ts TEXT, actor TEXT, event TEXT, detail TEXT);
 """
 
+
 def conn():
+    print("VERCEL:", bool(os.getenv("VERCEL")))
+    print("DATABASE_URL configured:", bool(DATABASE_URL))
+
     if DATABASE_URL:
+        print("Database backend: PostgreSQL")
         return psycopg.connect(
             DATABASE_URL,
             row_factory=dict_row,
@@ -62,6 +67,7 @@ def conn():
             "DATABASE_URL is missing in the Vercel environment."
         )
 
+    print("Database backend: SQLite (local fallback)")
     c = sqlite3.connect(DB)
     c.row_factory = sqlite3.Row
     return c
