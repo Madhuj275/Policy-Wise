@@ -1,0 +1,33 @@
+﻿# Secrets and environment files
+.env
+.env.*
+!.env.example
+backend/.env
+backend/.env.*
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local databases and logs
+*.db
+*.sqlite
+*.sqlite3
+*.log
+
+# Node and build output
+node_modules/
+frontend/node_modules/
+frontend/dist/
+
+# Vercel
+.vercel/
+
+# Editors and OS
+.vscode/*
+!.vscode/settings.json
+.DS_Store
+Thumbs.db
