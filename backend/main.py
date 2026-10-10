@@ -111,19 +111,41 @@ def q(sql, a=()):
     with connection() as database:
         return [dict(row) for row in database.execute(_prepare_sql(sql), a).fetchall()]
 
+
 def ex(sql, a=()):
     if DATABASE_URL:
         statement = _prepare_sql(sql)
-        if statement.lstrip().upper().startswith("INSERT "):
-            table = re.search(r"INSERT\s+INTO\s+(\w+)", statement, re.IGNORECASE)
-            if table and table.group(1).lower() in {"docs", "controls", "assessments", "changes", "mappings", "actions", "audit"} and "RETURNING" not in statement.upper():
+        is_insert = statement.lstrip().upper().startswith("INSERT ")
+
+        if is_insert and "RETURNING" not in statement.upper():
+            table = re.search(
+                r"INSERT\s+INTO\s+(\w+)",
+                statement,
+                re.IGNORECASE
+            )
+            if table and table.group(1).lower() in {
+                "docs", "controls", "assessments",
+                "changes", "mappings", "actions", "audit"
+            }:
                 statement += " RETURNING id"
+
         with connection() as database:
             cursor = database.execute(statement, a)
-            row = cursor.fetchone() if "RETURNING id" in statement.upper() else None
-            return row["id"] if row else None
+
+            if "RETURNING" in statement.upper():
+                row = cursor.fetchone()
+                if row is None:
+                    raise RuntimeError(
+                        "INSERT did not return an ID. "
+                        f"Statement: {statement}"
+                    )
+                return row["id"]
+
+            return None
+
     with connection() as database:
-        return database.execute(sql, a).lastrowid
+        cursor = database.execute(sql, a)
+        return cursor.lastrowid if sql.lstrip().upper().startswith("INSERT ") else None
 
 initialize_database()
 now = lambda: dt.datetime.utcnow().isoformat(timespec="seconds") + "Z"
@@ -285,6 +307,11 @@ def assess():
     prev = q("SELECT id FROM assessments ORDER BY id DESC LIMIT 1")
     ver = len(q("SELECT id FROM assessments")) + 1
     aid = ex("INSERT INTO assessments(version,old_doc,new_doc,ctrl_ver,mode,ts) VALUES(?,?,?,?,?,?)", (ver, o["id"], n["id"], ctrl_ver(), "gemini" if KEY else "offline", now()))
+    if aid is None:
+        raise HTTPException(
+            status_code=500,
+            detail="Assessment creation failed: missing database ID."
+        )
     for k in ctrls: ex("INSERT INTO snaps(aid,cid,data) VALUES(?,?,?) ON CONFLICT(aid,cid) DO NOTHING", (aid, k["id"], json.dumps(k)))  # snapshot controls as assessed
     eff = n.get("effective_date") or n["ts"][:10]
     changes = []
