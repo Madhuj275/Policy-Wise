@@ -10,6 +10,11 @@ from dotenv import load_dotenv
 load_dotenv()
 KEY = os.getenv("GEMINI_API_KEY"); MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+print("DATABASE_URL detected:", bool(DATABASE_URL))
+print(
+    "Database selected:",
+    "PostgreSQL" if DATABASE_URL else "SQLite"
+)
 DB = os.getenv("DB_PATH", "app.db")
 app = FastAPI(title="Policy Change Impact and Remediation Agent")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -45,7 +50,18 @@ CREATE TABLE IF NOT EXISTS audit(id BIGSERIAL PRIMARY KEY, ts TEXT, actor TEXT, 
 
 def conn():
     if DATABASE_URL:
-        return psycopg.connect(DATABASE_URL, row_factory=dict_row, connect_timeout=10, prepare_threshold=None)
+        return psycopg.connect(
+            DATABASE_URL,
+            row_factory=dict_row,
+            connect_timeout=10,
+            prepare_threshold=None
+        )
+
+    if os.getenv("VERCEL"):
+        raise RuntimeError(
+            "DATABASE_URL is missing in the Vercel environment."
+        )
+
     c = sqlite3.connect(DB)
     c.row_factory = sqlite3.Row
     return c
