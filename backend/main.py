@@ -1,11 +1,15 @@
 import os, json, re, sqlite3, difflib, hashlib, datetime as dt, logging, time, uuid
+from contextlib import contextmanager
 import requests
+import psycopg
+from psycopg.rows import dict_row
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 load_dotenv()
 KEY = os.getenv("GEMINI_API_KEY"); MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 DB = os.getenv("DB_PATH", "app.db")
 app = FastAPI(title="Policy Change Impact and Remediation Agent")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -15,7 +19,7 @@ if not workflow_logger.handlers:
     workflow_logger.addHandler(logging.StreamHandler())
 workflow_logger.propagate = False
 AI_PROMPT_VERSION = "policy-impact-v1"
-SCHEMA = """
+SCHEMA_SQLITE = """
 CREATE TABLE IF NOT EXISTS docs(id INTEGER PRIMARY KEY, kind TEXT, version INT, name TEXT, text TEXT, ts TEXT);
 CREATE TABLE IF NOT EXISTS controls(id INTEGER PRIMARY KEY, ref TEXT, name TEXT, description TEXT, owner TEXT, evidence TEXT, evidence_date TEXT, status TEXT, active INT DEFAULT 1);
 CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
@@ -26,21 +30,80 @@ CREATE TABLE IF NOT EXISTS actions(id INTEGER PRIMARY KEY, mid INT, text TEXT, o
 CREATE TABLE IF NOT EXISTS snaps(aid INT, cid INT, data TEXT, PRIMARY KEY(aid,cid));
 CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY, ts TEXT, actor TEXT, event TEXT, detail TEXT);
 """
+
+SCHEMA_POSTGRES = """
+CREATE TABLE IF NOT EXISTS docs(id BIGSERIAL PRIMARY KEY, kind TEXT, version INT, name TEXT, text TEXT, ts TEXT);
+CREATE TABLE IF NOT EXISTS controls(id BIGSERIAL PRIMARY KEY, ref TEXT, name TEXT, description TEXT, owner TEXT, evidence TEXT, evidence_date TEXT, status TEXT, active INT DEFAULT 1);
+CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
+CREATE TABLE IF NOT EXISTS assessments(id BIGSERIAL PRIMARY KEY, version INT, old_doc BIGINT, new_doc BIGINT, ctrl_ver INT, mode TEXT, ts TEXT);
+CREATE TABLE IF NOT EXISTS changes(id BIGSERIAL PRIMARY KEY, aid BIGINT, kind TEXT, old_sec TEXT, new_sec TEXT, old_text TEXT, new_text TEXT);
+CREATE TABLE IF NOT EXISTS mappings(id BIGSERIAL PRIMARY KEY, aid BIGINT, change_id BIGINT, control_id BIGINT, cfp TEXT, impact TEXT, rationale TEXT, outdated INT, outdated_reason TEXT, questions TEXT, suggested TEXT, source TEXT, decision TEXT DEFAULT 'pending', note TEXT, risk_reason TEXT, risk_review TEXT);
+CREATE TABLE IF NOT EXISTS actions(id BIGSERIAL PRIMARY KEY, mid BIGINT, text TEXT, owner TEXT, status TEXT DEFAULT 'Open');
+CREATE TABLE IF NOT EXISTS snaps(aid BIGINT, cid BIGINT, data TEXT, PRIMARY KEY(aid,cid));
+CREATE TABLE IF NOT EXISTS audit(id BIGSERIAL PRIMARY KEY, ts TEXT, actor TEXT, event TEXT, detail TEXT);
+"""
+
 def conn():
-    c = sqlite3.connect(DB); c.row_factory = sqlite3.Row; return c
-_schema_connection = conn()
-try:
-    c = _schema_connection
-    c.executescript(SCHEMA)
-    for _a in ("ALTER TABLE docs ADD COLUMN effective_date TEXT", "ALTER TABLE mappings ADD COLUMN answers TEXT"):
-        try: c.execute(_a)
-        except sqlite3.OperationalError: pass
-finally:
-    _schema_connection.close()
+    if DATABASE_URL:
+        return psycopg.connect(DATABASE_URL, row_factory=dict_row, connect_timeout=10, prepare_threshold=None)
+    c = sqlite3.connect(DB)
+    c.row_factory = sqlite3.Row
+    return c
+
+@contextmanager
+def connection():
+    database = conn()
+    try:
+        with database:
+            yield database
+    finally:
+        database.close()
+
+def initialize_database():
+    database = conn()
+    try:
+        if DATABASE_URL:
+            for statement in SCHEMA_POSTGRES.split(";"):
+                if statement.strip():
+                    database.execute(statement)
+            database.execute("ALTER TABLE docs ADD COLUMN IF NOT EXISTS effective_date TEXT")
+            database.execute("ALTER TABLE mappings ADD COLUMN IF NOT EXISTS answers TEXT")
+            database.commit()
+        else:
+            database.executescript(SCHEMA_SQLITE)
+            for statement in ("ALTER TABLE docs ADD COLUMN effective_date TEXT", "ALTER TABLE mappings ADD COLUMN answers TEXT"):
+                try:
+                    database.execute(statement)
+                except sqlite3.OperationalError as error:
+                    if "duplicate column name" not in str(error).lower():
+                        raise
+    finally:
+        database.close()
+
+def _prepare_sql(sql):
+    if not DATABASE_URL:
+        return sql
+    return sql.replace("?", "%s")
+
 def q(sql, a=()):
-    with conn() as c: return [dict(r) for r in c.execute(sql, a).fetchall()]
+    with connection() as database:
+        return [dict(row) for row in database.execute(_prepare_sql(sql), a).fetchall()]
+
 def ex(sql, a=()):
-    with conn() as c: return c.execute(sql, a).lastrowid
+    if DATABASE_URL:
+        statement = _prepare_sql(sql)
+        if statement.lstrip().upper().startswith("INSERT "):
+            table = re.search(r"INSERT\s+INTO\s+(\w+)", statement, re.IGNORECASE)
+            if table and table.group(1).lower() in {"docs", "controls", "assessments", "changes", "mappings", "actions", "audit"} and "RETURNING" not in statement.upper():
+                statement += " RETURNING id"
+        with connection() as database:
+            cursor = database.execute(statement, a)
+            row = cursor.fetchone() if "RETURNING id" in statement.upper() else None
+            return row["id"] if row else None
+    with connection() as database:
+        return database.execute(sql, a).lastrowid
+
+initialize_database()
 now = lambda: dt.datetime.utcnow().isoformat(timespec="seconds") + "Z"
 def log(event, detail="", actor="reviewer"): ex("INSERT INTO audit(ts,actor,event,detail) VALUES(?,?,?,?)", (now(), actor, event, detail))
 def structured_log(event, **fields):
@@ -81,7 +144,7 @@ async def log_http_request(request, call_next):
 def ctrl_ver():
     r = q("SELECT v FROM meta WHERE k='ctrl_ver'"); return int(r[0]["v"]) if r else 1
 def bump():
-    ex("INSERT OR REPLACE INTO meta VALUES('ctrl_ver',?)", (str(ctrl_ver() + 1),))
+    ex("INSERT INTO meta(k,v) VALUES('ctrl_ver',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", (str(ctrl_ver() + 1),))
 fp = lambda c: hashlib.md5("|".join(str(c[k]) for k in ("description", "owner", "evidence", "evidence_date", "status")).encode()).hexdigest()
 h = lambda s: hashlib.md5(s.encode()).hexdigest()
 
@@ -200,7 +263,7 @@ def assess():
     prev = q("SELECT id FROM assessments ORDER BY id DESC LIMIT 1")
     ver = len(q("SELECT id FROM assessments")) + 1
     aid = ex("INSERT INTO assessments(version,old_doc,new_doc,ctrl_ver,mode,ts) VALUES(?,?,?,?,?,?)", (ver, o["id"], n["id"], ctrl_ver(), "gemini" if KEY else "offline", now()))
-    for k in ctrls: ex("INSERT INTO snaps VALUES(?,?,?)", (aid, k["id"], json.dumps(k)))  # snapshot controls as assessed
+    for k in ctrls: ex("INSERT INTO snaps(aid,cid,data) VALUES(?,?,?) ON CONFLICT(aid,cid) DO NOTHING", (aid, k["id"], json.dumps(k)))  # snapshot controls as assessed
     eff = n.get("effective_date") or n["ts"][:10]
     changes = []
     for kind, os_, ns, ot, nt in diff(sections(o["text"]), sections(n["text"])):
@@ -321,7 +384,7 @@ def review(mid: int, r: Review):
     if r.decision == "corrected":
         k = q("SELECT * FROM controls WHERE id=?", (r.control_id or m["control_id"],))
         if not k: raise HTTPException(400, "Unknown control")
-        ex("INSERT OR IGNORE INTO snaps VALUES(?,?,?)", (m["aid"], k[0]["id"], json.dumps(k[0])))
+        ex("INSERT INTO snaps(aid,cid,data) VALUES(?,?,?) ON CONFLICT(aid,cid) DO NOTHING", (m["aid"], k[0]["id"], json.dumps(k[0])))
         ex("UPDATE mappings SET control_id=?,impact=?,cfp=? WHERE id=?", (k[0]["id"], r.impact or m["impact"], fp(k[0]), mid))
     ex("UPDATE mappings SET decision=?,note=? WHERE id=?", (r.decision, r.note, mid))
     log(f"mapping_{r.decision}", f"mapping {mid} (was control {m['control_id']}/{m['impact']})"); return {"ok": True}
@@ -414,7 +477,7 @@ def manual_map(cid: int, r: Manual):
     if not c or not k: raise HTTPException(404, "Change or control not found")
     c, k = c[0], k[0]
     if q("SELECT id FROM mappings WHERE change_id=? AND control_id=?", (cid, k["id"])): raise HTTPException(400, "A mapping to this control already exists.")
-    ex("INSERT OR IGNORE INTO snaps VALUES(?,?,?)", (c["aid"], k["id"], json.dumps(k)))
+    ex("INSERT INTO snaps(aid,cid,data) VALUES(?,?,?) ON CONFLICT(aid,cid) DO NOTHING", (c["aid"], k["id"], json.dumps(k)))
     nd = q("SELECT d.* FROM docs d JOIN assessments a ON a.new_doc=d.id WHERE a.id=?", (c["aid"],))[0]
     det = stale_ev(k, nd.get("effective_date") or nd["ts"][:10])
     i = ex("INSERT INTO mappings(aid,change_id,control_id,cfp,impact,rationale,outdated,outdated_reason,questions,suggested,source,decision,note) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",

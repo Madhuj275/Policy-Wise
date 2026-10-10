@@ -62,14 +62,24 @@ Backend configuration is loaded from `backend/.env`:
 | --- | --- | --- |
 | `GEMINI_API_KEY` | Enables Gemini-powered control mapping and context re-analysis. | Unset; offline heuristic is used. |
 | `GEMINI_MODEL` | Gemini model name. | `gemini-2.5-flash` |
-| `DB_PATH` | SQLite database path. | `app.db` (relative to the backend process working directory) |
+| `DATABASE_URL` | PostgreSQL/Neon connection string. When set, PostgreSQL is used instead of SQLite. | Unset |
+| `DB_PATH` | Local SQLite database path, used only when `DATABASE_URL` is unset. | `app.db` (relative to the backend process working directory) |
 | `AI_LOG_CONTENT` | Opt-in to write raw AI prompts and responses to application logs. | `false` |
 
 Do not commit `.env`, API keys, or raw-content diagnostic logs. Prompts may contain policy text, control evidence, and reviewer answers. Keep `AI_LOG_CONTENT=false` except during approved diagnostics; protect and delete any captured logs according to your data-handling policy.
 
+### Use Neon PostgreSQL
+
+1. Create a Neon project/database and copy its PostgreSQL connection string. Use Neon’s pooled connection string for serverless deployments and keep its TLS setting (`sslmode=require`).
+2. For local development, put `DATABASE_URL` in `backend/.env` (or leave it unset to use SQLite). Do not commit this file.
+3. In Vercel, add `DATABASE_URL` as an environment variable for the backend service in Production (and Preview if needed). Enter it through the Vercel dashboard or CLI prompt; do not commit or paste the secret into source code.
+4. Redeploy. On startup, the backend creates missing tables and adds its current compatibility columns. Existing SQLite records are **not** copied to Neon; export/import or seed the desired data separately.
+
+The backend uses psycopg 3 for PostgreSQL and disables server-side prepared statements for compatibility with pooled connections. Local SQLite remains available for development and tests.
+
 ## Architecture
 
-- `backend/main.py` — FastAPI API, SQLite schema and persistence, numbered clause parsing/diff, assessment logic, Gemini integration and heuristic fallback, deterministic summary/staleness checks, reviewer operations, audit events, and report data endpoint.
+- `backend/main.py` — FastAPI API, SQLite/Neon PostgreSQL schema and persistence, numbered clause parsing/diff, assessment logic, Gemini integration and heuristic fallback, deterministic summary/staleness checks, reviewer operations, audit events, and report data endpoint.
 - `backend/tests/test_ai_workflow.py` — isolated `unittest` coverage for AI workflow validation, failure fallback, structured telemetry, and audit redaction.
 - `frontend/src/App.jsx` — workspace state, Radix UI navigation, loading, and shared feedback.
 - `frontend/src/components/Inputs.jsx` — policy version inputs and the control register.
@@ -78,7 +88,7 @@ Do not commit `.env`, API keys, or raw-content diagnostic logs. Prompts may cont
 - `frontend/src/lib/api.js` — JSON API client.
 - `frontend/src/styles.css` — responsive app styles.
 
-React/Vite serves the frontend. FastAPI exposes `/api` endpoints. SQLite stores policy versions, controls, assessments, change clauses, mappings, action items, control snapshots, and audit events. Gemini is used only when configured; a failed or empty Gemini assessment falls back to a labelled local heuristic. Suggested remediation is subject to reviewer approval.
+React/Vite serves the frontend. FastAPI exposes `/api` endpoints. PostgreSQL (when `DATABASE_URL` is set) or SQLite (local default) stores policy versions, controls, assessments, change clauses, mappings, action items, control snapshots, and audit events. Gemini is used only when configured; a failed or empty Gemini assessment falls back to a labelled local heuristic. Suggested remediation is subject to reviewer approval.
 
 ## Completed scope
 
@@ -116,9 +126,9 @@ Frontend tests use Node's built-in test runner to exercise PDF creation, filenam
 - Audit events have no authenticated reviewer identity or tamper-evident hash chain. They are application records, not a security-grade immutable audit service.
 - Counts intentionally have different aggregation levels: `mapped`/`unmapped` count changed clauses, while `compliant`, `unresolved`, and several review/risk counts are mapping-oriented. Interpret the labels with that distinction.
 - Gemini analysis depends on provider availability and the configured model. The heuristic fallback is intentionally conservative and may miss impacts; all mappings should be reviewed.
-- SQLite and the development CORS settings are suitable for local evaluation only. No production hosting, container, cloud infrastructure, authentication, managed database, backups, or monitoring configuration is included.
+- SQLite and the development CORS settings are suitable for local evaluation only. Neon PostgreSQL can be configured through `DATABASE_URL`, but this repository does not provision a Neon database, configure backups, authentication, production CORS, or monitoring.
 - Unrestricted legal research, external compliance-platform integration, automatic enforcement, and modification of production systems are excluded.
 
 ## Deployment status and notes
 
-**This repository does not currently deploy the application.** There are no checked-in Docker, cloud infrastructure, or hosting manifests. For a local production frontend bundle, run `npm run build` in `frontend`; serve the generated `frontend/dist` directory from a configured web host and deploy the FastAPI backend separately. Before public/production exposure, configure a restricted CORS origin, HTTPS, authentication/authorization, secure secret management, persistent backed-up database storage, log retention/access controls, and monitoring. Configure the frontend's API routing for the deployed backend rather than relying on the local Vite proxy.
+The repository may be linked to Vercel with the generated multi-service `vercel.json`, but deployment is not verified by this README and a Git connection/deployment does not provision Neon. Configure `DATABASE_URL` in Vercel and redeploy to enable persistent PostgreSQL storage. Before public/production exposure, configure a restricted CORS origin, HTTPS, authentication/authorization, secure secret management, database backups, log retention/access controls, and monitoring.

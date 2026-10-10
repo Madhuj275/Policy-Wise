@@ -8,6 +8,7 @@ from unittest import mock
 TEST_DIRECTORY = tempfile.TemporaryDirectory(prefix="policy-agent-tests-", ignore_cleanup_errors=True)
 DB_FILE = os.path.join(TEST_DIRECTORY.name, "workflow.sqlite3")
 os.environ["DB_PATH"] = DB_FILE
+os.environ["DATABASE_URL"] = ""
 os.environ["GEMINI_API_KEY"] = "unit-test-key"
 os.environ["AI_LOG_CONTENT"] = "false"
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -29,7 +30,6 @@ class FakeResponse:
 class AIWorkflowTests(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
-        api.c.close()
         TEST_DIRECTORY.cleanup()
 
     def setUp(self):
